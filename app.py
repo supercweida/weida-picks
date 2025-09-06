@@ -2,11 +2,15 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 import requests
+from zoneinfo import ZoneInfo
 
-def get_nfl_spreads(api_key):
+# --- Your function (unchanged) ---
+def get_nfl_spreads(api_key, week_number: int = None):
     """
-    Fetch FanDuel NFL spreads for the upcoming week's games (Tue–Mon window),
-    with one row per game, including week_number, favorite, underdog, and autopick.
+    Fetch FanDuel NFL spreads for a given NFL week (Tue–Mon window).
+    
+    Output columns: week_number, favorite_team, underdog_team, home_team,
+    favorite_spread, underdog_spread, commence_time (CST, AM/PM), autopick.
     """
     odds_url = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
     params = {
@@ -25,36 +29,33 @@ def get_nfl_spreads(api_key):
     if not odds_data:
         return pd.DataFrame()
 
-    now = datetime.now(timezone.utc)
+    # --- Anchoring season start at 12:01 AM CT, Tuesday Sept 2, 2025 ---
+    ct = ZoneInfo("America/Chicago")
+    season_start_ct = datetime(2025, 9, 2, 0, 1, tzinfo=ct)
 
-    # --- Step 1: find the next game (closest future commence_time) ---
-    future_games = [
-        datetime.fromisoformat(game["commence_time"].replace("Z", "+00:00"))
-        for game in odds_data
-        if datetime.fromisoformat(game["commence_time"].replace("Z", "+00:00")) >= now
-    ]
-    if not future_games:
-        return pd.DataFrame()
+    # --- Step 1: Determine week_number ---
+    now_ct = datetime.now(ct)
+    if week_number is None:
+        week_number = ((now_ct - season_start_ct).days // 7) + 1
 
-    next_game_time = min(future_games)
+    # --- Step 2: Compute window for that week ---
+    week_start_ct = season_start_ct + timedelta(weeks=week_number - 1)
+    week_end_ct = week_start_ct + timedelta(days=6, hours=23, minutes=58, seconds=59)
 
-    # --- Step 2: compute the Tue–Mon window containing that game ---
-    days_since_tuesday = (next_game_time.weekday() - 1) % 7
-    week_start = (next_game_time - timedelta(days=days_since_tuesday)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+    # Convert boundaries to UTC for API comparisons
+    week_start = week_start_ct.astimezone(timezone.utc)
+    week_end = week_end_ct.astimezone(timezone.utc)
 
-    # --- Step 3: compute week_number based on NFL season start ---
-    season_start = datetime(2025, 9, 2, tzinfo=timezone.utc)  # Week 1 Tuesday
-    week_number = ((week_start - season_start).days // 7) + 1
-
-    # --- Step 4: collect spreads only for FanDuel in that window ---
+    # --- Step 3: Collect spreads only for FanDuel within that week ---
     games_list = []
     for game in odds_data:
-        game_time = datetime.fromisoformat(game["commence_time"].replace("Z", "+00:00"))
-        if not (week_start <= game_time <= week_end):
+        game_time_utc = datetime.fromisoformat(game["commence_time"].replace("Z", "+00:00"))
+        if not (week_start <= game_time_utc <= week_end):
             continue
+
+        # Convert kickoff time to Central Time for display
+        game_time_ct = game_time_utc.astimezone(ct)
+        game_time_fmt = game_time_ct.strftime("%A %I:%M %p")  # Monday 07:15 PM
 
         home_team = game["home_team"]
         away_team = game["away_team"]
@@ -77,46 +78,59 @@ def get_nfl_spreads(api_key):
 
                 games_list.append({
                     "week_number": week_number,
-                    "home_team": home_team,
-                    "away_team": away_team,
                     "favorite_team": favorite["name"] if favorite else None,
-                    "favorite_spread": favorite.get("point") if favorite else None,
-                    "favorite_price": favorite.get("price") if favorite else None,
                     "underdog_team": underdog["name"] if underdog else None,
+                    "home_team": home_team,
+                    "favorite_spread": favorite.get("point") if favorite else None,
                     "underdog_spread": underdog.get("point") if underdog else None,
-                    "underdog_price": underdog.get("price") if underdog else None,
-                    "commence_time": game_time
+                    "commence_time": game_time_fmt
                 })
 
     df = pd.DataFrame(games_list)
     if df.empty:
         return df
 
-    # --- Step 5: determine Autopick ---
+    # --- Step 4: Determine Autopick (biggest favorite) ---
     favorites_df = df.dropna(subset=["favorite_spread"]).copy()
     if not favorites_df.empty:
         best_fav = favorites_df.sort_values(
             by=["favorite_spread", "commence_time"], ascending=[True, True]
         ).iloc[0]
         df["autopick"] = df.apply(
-            lambda row: "Yes" if row["favorite_team"] == best_fav["favorite_team"] and 
-                                   row["commence_time"] == best_fav["commence_time"]
+            lambda row: "Yes" if row["favorite_team"] == best_fav["favorite_team"]
+                        and row["commence_time"] == best_fav["commence_time"]
                         else "No",
             axis=1
         )
     else:
         df["autopick"] = "No"
 
+    # Reorder columns for clarity
+    df = df[[
+        "week_number",
+        "favorite_team",
+        "underdog_team",
+        "favorite_spread",
+        "underdog_spread",
+        "home_team",
+        "commence_time",
+        "autopick"
+    ]]
+
     return df
 
 api_key = "41e45f964d812e7102f96fb8fe7def65"
 
+# --- Streamlit App ---
+
 st.title("NFL Weekly Spreads (FanDuel)")
-df = get_nfl_spreads(api_key)
+
+# Week selector 1–18
+week_selected = st.selectbox("Select Week", list(range(1, 19)))
+
+df = get_nfl_spreads(api_key, week_selected)
 
 if df.empty:
-    st.warning("No games found.")
+    st.warning(f"No games found for Week {week_selected}.")
 else:
-    week_options = sorted(df["week_number"].unique())
-    week_selected = st.selectbox("Select Week", week_options)
-    st.dataframe(df[df["week_number"] == week_selected])
+    st.dataframe(df)
