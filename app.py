@@ -102,6 +102,8 @@ api_key = "41e45f964d812e7102f96fb8fe7def65"
 
 st.title("WeidaPicks - NFL Weekly Spreads (FanDuel)")
 
+st.set_page_config(layout="wide")
+
 # Refresh button triggers API call
 if st.button("🔄 Refresh Spreads"):
     st.session_state["all_spreads"] = fetch_all_spreads(api_key)
