@@ -18,9 +18,9 @@ def moneyline_to_points(odds: int) -> float:
     if odds is None:
         return None
     if odds > 0:
-        return round(odds / 10, 2)
+        return round((odds / 100) * 10, 2)
     else:
-        return round(-10 / odds, 2)
+        return round((-100 / odds) * 10, 2)
 
 
 # --- Fetch ALL odds (Spreads + Moneyline) ---
