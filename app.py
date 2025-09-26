@@ -13,13 +13,23 @@ def get_week_bounds(week_number: int):
     return week_start_ct.astimezone(timezone.utc), week_end_ct.astimezone(timezone.utc)
 
 
-# --- Fetch ALL spreads at once ---
-def fetch_all_spreads(api_key: str):
+# --- Helper: convert moneyline odds to points ---
+def moneyline_to_points(odds: int) -> float:
+    if odds is None:
+        return None
+    if odds > 0:
+        return round(odds / 100, 2)
+    else:
+        return round(-100 / odds, 2)
+
+
+# --- Fetch ALL odds (Spreads + Moneyline) ---
+def fetch_all_odds(api_key: str):
     odds_url = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
     params = {
         "apiKey": api_key,
         "regions": "us",
-        "markets": "spreads",
+        "markets": "spreads,moneyline",  # include moneyline
         "oddsFormat": "american"
     }
 
@@ -35,13 +45,14 @@ def fetch_all_spreads(api_key: str):
     ct = ZoneInfo("America/Chicago")
     season_start_ct = datetime(2025, 9, 2, 0, 1, tzinfo=ct)
 
-    games_list = []
+    spreads_list = []
+    moneyline_list = []
+
     for game in odds_data:
         game_time_utc = datetime.fromisoformat(game["commence_time"].replace("Z", "+00:00"))
         game_time_ct = game_time_utc.astimezone(ct)
-        game_time_fmt = game_time_ct.strftime("%A %I:%M %p")  # Monday 07:15 PM
+        game_time_fmt = game_time_ct.strftime("%A %I:%M %p")
 
-        # Figure out week_number for this game
         delta_days = (game_time_ct - season_start_ct).days
         week_number = (delta_days // 7) + 1
 
@@ -51,32 +62,61 @@ def fetch_all_spreads(api_key: str):
         if not fanduel:
             continue
 
-        spread_data = fanduel.get("markets", [])
-        if spread_data:
-            outcomes = spread_data[0].get("outcomes", [])
+        # --- Spreads ---
+        spread_market = next((m for m in fanduel.get("markets", []) if m["key"] == "spreads"), None)
+        if spread_market:
+            outcomes = spread_market.get("outcomes", [])
             if len(outcomes) == 2:
-                team1, team2 = outcomes
-                if team1.get("point") < team2.get("point"):
-                    favorite, underdog = team1, team2
-                elif team2.get("point") < team1.get("point"):
-                    favorite, underdog = team2, team1
+                t1, t2 = outcomes
+                if t1.get("point") < t2.get("point"):
+                    favorite, underdog = t1, t2
+                elif t2.get("point") < t1.get("point"):
+                    favorite, underdog = t2, t1
                 else:
                     favorite, underdog = None, None
 
-                games_list.append({
+                spreads_list.append({
                     "week_number": week_number,
+                    "home_team": home_team,
+                    "commence_time": game_time_fmt,
                     "favorite_team": favorite["name"] if favorite else None,
                     "underdog_team": underdog["name"] if underdog else None,
-                    "home_team": home_team,
                     "favorite_spread": favorite.get("point") if favorite else None,
-                    "underdog_spread": underdog.get("point") if underdog else None,
-                    "commence_time": game_time_fmt
+                    "underdog_spread": underdog.get("point") if underdog else None
                 })
 
-    df = pd.DataFrame(games_list)
+        # --- Moneyline ---
+        moneyline_market = next((m for m in fanduel.get("markets", []) if m["key"] in ["h2h", "moneyline"]), None)
+        if moneyline_market:
+            ml_outcomes = {o["name"]: o["price"] for o in moneyline_market.get("outcomes", [])}
+            away_team = next((t for t in ml_outcomes.keys() if t != home_team), None)
+            ml_home = ml_outcomes.get(home_team)
+            ml_away = ml_outcomes.get(away_team)
 
+            moneyline_list.append({
+                "week_number": week_number,
+                "home_team": home_team,
+                "away_team": away_team,
+                "commence_time": game_time_fmt,
+                "moneyline_home": ml_home,
+                "moneyline_away": ml_away,
+                "moneyline_home_points": moneyline_to_points(ml_home),
+                "moneyline_away_points": moneyline_to_points(ml_away)
+            })
+
+    df_spreads = pd.DataFrame(spreads_list)
+    df_moneyline = pd.DataFrame(moneyline_list)
+
+    # Merge spreads + moneyline into one DataFrame
+    df = pd.merge(
+        df_spreads,
+        df_moneyline,
+        on=["week_number", "home_team", "commence_time"],
+        how="outer"
+    )
+
+    # Add autopick column
     if not df.empty:
-        # Add Autopick (biggest favorite per week)
         df["autopick"] = "No"
         for week in df["week_number"].unique():
             week_df = df[df["week_number"] == week].dropna(subset=["favorite_spread"]).copy()
@@ -100,22 +140,23 @@ def filter_week(df, week_number: int):
 # --- Streamlit App ---
 api_key = "41e45f964d812e7102f96fb8fe7def65"
 
-st.title("WeidaPicks - NFL Weekly Spreads (FanDuel)")
-
 st.set_page_config(layout="wide")
+st.title("WeidaPicks - NFL Weekly Odds (FanDuel)")
 
 # Refresh button triggers API call
-if st.button("🔄 Refresh Spreads"):
-    st.session_state["all_spreads"] = fetch_all_spreads(api_key)
+if st.button("🔄 Refresh Odds"):
+    st.session_state["all_odds"] = fetch_all_odds(api_key)
 
 # Week selection (1–18)
 week_selected = st.selectbox("Select Week", list(range(1, 19)))
 
-if "all_spreads" not in st.session_state or st.session_state["all_spreads"].empty:
-    st.info("Click 'Refresh Spreads' to load the latest odds.")
+if "all_odds" not in st.session_state or st.session_state["all_odds"].empty:
+    st.info("Click 'Refresh Odds' to load the latest data.")
 else:
-    df = filter_week(st.session_state["all_spreads"], week_selected)
+    df = filter_week(st.session_state["all_odds"], week_selected)
+
     if df.empty:
-        st.warning(f"No games found for Week {week_selected}.")
+        st.warning(f"No odds found for Week {week_selected}.")
     else:
+        st.subheader("🏈 Combined Spreads + Moneyline (FanDuel)")
         st.dataframe(df)
