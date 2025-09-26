@@ -29,7 +29,7 @@ def fetch_all_odds(api_key: str):
     params = {
         "apiKey": api_key,
         "regions": "us",
-        "markets": "spreads,moneyline",  # include moneyline
+        "markets": "spreads,h2h",  # include moneyline
         "oddsFormat": "american"
     }
 
