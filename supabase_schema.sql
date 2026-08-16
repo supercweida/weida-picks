@@ -29,6 +29,7 @@ create table if not exists public.picks (
   season integer not null,
   week integer not null,
   picked_team text not null,
+  is_autopick boolean not null default false,
   submitted_at timestamptz not null default now(),
   unique (user_id, season, week)
 );
@@ -36,6 +37,9 @@ create table if not exists public.picks (
 alter table public.profiles enable row level security;
 alter table public.games enable row level security;
 alter table public.picks enable row level security;
+
+alter table public.picks
+add column if not exists is_autopick boolean not null default false;
 
 create policy "Signed-in users can see players"
 on public.profiles for select to authenticated using (true);
@@ -88,6 +92,11 @@ with check (
 grant select on public.profiles, public.games, public.picks to authenticated;
 grant insert, update on public.picks to authenticated;
 grant usage, select on sequence public.picks_id_seq to authenticated;
+
+-- Server-only admin operations use the secret/service-role key. RLS is bypassed
+-- for this role, but PostgreSQL table and sequence privileges are still required.
+grant all privileges on public.profiles, public.games, public.picks to service_role;
+grant all privileges on sequence public.picks_id_seq to service_role;
 
 -- After creating the four users in Authentication > Users, add their profiles:
 -- insert into public.profiles (id, display_name)

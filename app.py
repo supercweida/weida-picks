@@ -10,6 +10,7 @@ from supabase import Client, create_client
 
 
 CT = ZoneInfo("America/Chicago")
+STARTING_POINTS = 30.0
 
 
 def setting(name: str, default=None):
@@ -84,12 +85,162 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return games, picks, profiles
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def sync_completed_scores() -> dict:
+    """Update recently completed games, at most once per app process per 15 minutes."""
+    api_key = st.secrets.get("odds_api", {}).get("api_key")
+    if not api_key:
+        return {"updated": 0, "error": "The Odds API key is not configured."}
+
+    try:
+        client = admin_client()
+        unfinished = (
+            client.table("games")
+            .select("id,kickoff")
+            .eq("completed", False)
+            .execute()
+            .data
+            or []
+        )
+        now = datetime.now(CT)
+        earliest = now - timedelta(days=4)
+        candidate_ids = {
+            row["id"]
+            for row in unfinished
+            if earliest
+            <= datetime.fromisoformat(row["kickoff"].replace("Z", "+00:00")).astimezone(CT)
+            <= now
+        }
+        if not candidate_ids:
+            return {"updated": 0, "error": None}
+
+        response = requests.get(
+            "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores",
+            params={"apiKey": api_key, "daysFrom": 3, "dateFormat": "iso"},
+            timeout=20,
+        )
+        response.raise_for_status()
+
+        updated = 0
+        for game in response.json():
+            if game.get("id") not in candidate_ids or not game.get("completed"):
+                continue
+            scores = {
+                score["name"]: int(score["score"])
+                for score in (game.get("scores") or [])
+                if score.get("score") is not None
+            }
+            home = game.get("home_team")
+            away = game.get("away_team")
+            if home not in scores or away not in scores:
+                continue
+            winner = None
+            if scores[home] > scores[away]:
+                winner = home
+            elif scores[away] > scores[home]:
+                winner = away
+            client.table("games").update(
+                {"winner_team": winner, "completed": True}
+            ).eq("id", game["id"]).execute()
+            updated += 1
+
+        return {
+            "updated": updated,
+            "error": None,
+            "remaining": response.headers.get("x-requests-remaining"),
+        }
+    except Exception as exc:
+        return {"updated": 0, "error": str(exc)}
+
+
 def display_name(user_id: str, profiles: pd.DataFrame) -> str:
     if not profiles.empty:
         match = profiles[profiles["id"] == user_id]
         if not match.empty:
             return str(match.iloc[0]["display_name"])
     return "Player"
+
+
+
+
+def numeric_or_none(value) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def format_points(value) -> str:
+    number = numeric_or_none(value)
+    if number is None:
+        return "TBD"
+    if number == 0:
+        return "0"
+    sign = "+" if number > 0 else ""
+    return f"{sign}{number:g}"
+
+
+def format_points_label(value) -> str:
+    formatted = format_points(value)
+    return formatted if formatted == "TBD" else f"{formatted} pts"
+
+
+def format_spread(value) -> str:
+    number = numeric_or_none(value)
+    return "TBD" if number is None else format_points(number)
+
+
+def format_kickoff(value) -> str:
+    when = value.tz_convert(CT) if hasattr(value, "tz_convert") else value.astimezone(CT)
+    return when.strftime("%a %b %d, %I:%M %p CT").replace(" 0", " ")
+
+
+def pick_spread(game: pd.Series, team: str) -> float | None:
+    if team == game["away_team"]:
+        return numeric_or_none(game.get("away_spread"))
+    if team == game["home_team"]:
+        return numeric_or_none(game.get("home_spread"))
+    return None
+
+
+def movement_for_result(spread: float | None, won: bool) -> float | None:
+    if spread is None:
+        return None
+    if won:
+        return spread if spread > 0 else 0.0
+    return -5.0 if spread >= 0 else -5.0 + spread
+
+
+def pick_movement(game: pd.Series, team: str) -> float | None:
+    if not bool(game.get("completed")):
+        return None
+    if pd.isna(game.get("winner_team")):
+        return 0.0
+    spread = pick_spread(game, team)
+    return movement_for_result(spread, team == game["winner_team"])
+
+
+def pick_is_autopick(pick: pd.Series) -> bool:
+    return bool(pick.get("is_autopick", False)) if "is_autopick" in pick.index else False
+
+
+def option_summary(game: pd.Series, team: str) -> dict[str, str]:
+    spread = pick_spread(game, team)
+    win = movement_for_result(spread, True)
+    loss = movement_for_result(spread, False)
+    return {
+        "Pick": f"{team} {format_spread(spread)}",
+        "Game": f"{game['away_team']} at {game['home_team']}",
+        "Kickoff": format_kickoff(game["kickoff"]),
+        "If Pick Wins": format_points_label(win),
+        "If Pick Loses": format_points_label(loss),
+    }
+
+
+def option_choice_label(summary: dict[str, str]) -> str:
+    return (
+        f"{summary['Pick']} - win {summary['If Pick Wins']}, "
+        f"lose {summary['If Pick Loses']}"
+    )
 
 
 def season_and_week(games: pd.DataFrame) -> tuple[int, int]:
@@ -111,7 +262,10 @@ def season_and_week(games: pd.DataFrame) -> tuple[int, int]:
 def make_pick_page(
     games: pd.DataFrame, picks: pd.DataFrame, profiles: pd.DataFrame, season: int, week: int
 ) -> None:
-    st.header(f"Make a pick — Week {week}")
+    st.header(f"Make a pick - Week {week}")
+    if games.empty:
+        st.info("No games have been imported yet. Ask an administrator to refresh games.")
+        return
     week_games = games[(games["season"] == season) & (games["week"] == week)].copy()
     if week_games.empty:
         st.info("No games have been imported for this week yet.")
@@ -130,20 +284,39 @@ def make_pick_page(
 
     if not mine.empty:
         row = mine.iloc[0]
-        st.success(f"Your current pick: **{row['picked_team']}**")
+        current_game = week_games[week_games["id"] == row["game_id"]]
+        if current_game.empty:
+            st.success(f"Your current pick: **{row['picked_team']}**")
+        else:
+            summary = option_summary(current_game.iloc[0], row["picked_team"])
+            source = "Autopick" if pick_is_autopick(row) else "Manual pick"
+            st.success(
+                f"Your current pick: **{summary['Pick']}** ({source}) - "
+                f"win: {summary['If Pick Wins']}, lose: {summary['If Pick Loses']}"
+            )
 
     if available.empty:
         st.warning("All games for this week have started; picks are locked.")
         return
 
     choices: dict[str, tuple[str, str]] = {}
+    option_rows = []
     for _, game in available.iterrows():
-        kickoff = game["kickoff"].tz_convert(CT).strftime("%a %b %-d, %-I:%M %p CT")
         for team in (game["away_team"], game["home_team"]):
-            choices[f"{team} — {game['away_team']} at {game['home_team']} ({kickoff})"] = (
-                game["id"],
-                team,
-            )
+            summary = option_summary(game, team)
+            label = option_choice_label(summary)
+            option_rows.append({"Select": label, **summary})
+            choices[label] = (game["id"], team)
+
+    st.caption(
+        "Each option uses the FanDuel spread and shows exactly what your score moves "
+        "if that pick wins or loses."
+    )
+    st.dataframe(
+        pd.DataFrame(option_rows)[["Game", "Kickoff", "Pick", "If Pick Wins", "If Pick Loses"]],
+        hide_index=True,
+        use_container_width=True,
+    )
 
     existing_label = None
     if not mine.empty:
@@ -155,8 +328,8 @@ def make_pick_page(
 
     with st.form("pick_form"):
         labels = list(choices)
-        selected = st.selectbox(
-            "Team",
+        selected = st.radio(
+            "Pick option",
             labels,
             index=labels.index(existing_label) if existing_label in labels else 0,
         )
@@ -170,24 +343,33 @@ def make_pick_page(
             "season": season,
             "week": week,
             "picked_team": team,
+            "is_autopick": False,
         }
         try:
-            user_client().table("picks").upsert(
-                payload, on_conflict="user_id,season,week"
-            ).execute()
+            try:
+                user_client().table("picks").upsert(
+                    payload, on_conflict="user_id,season,week"
+                ).execute()
+            except Exception as exc:
+                if "is_autopick" not in str(exc):
+                    raise
+                payload.pop("is_autopick", None)
+                user_client().table("picks").upsert(
+                    payload, on_conflict="user_id,season,week"
+                ).execute()
             st.success(f"Saved {team} for Week {week}.")
             st.rerun()
         except Exception as exc:
             st.error(f"The pick could not be saved: {exc}")
 
-
 def weekly_picks_page(
     games: pd.DataFrame, picks: pd.DataFrame, profiles: pd.DataFrame, season: int, week: int
 ) -> None:
-    st.header(f"Weekly picks — Week {week}")
+    st.header(f"Weekly picks - Week {week}")
     if profiles.empty:
         st.info("No player profiles have been created yet.")
         return
+    week_games = games[(games["season"] == season) & (games["week"] == week)] if not games.empty else games
     rows = []
     for _, profile in profiles.sort_values("display_name").iterrows():
         pick = pd.DataFrame()
@@ -197,43 +379,96 @@ def weekly_picks_page(
                 & (picks["season"] == season)
                 & (picks["week"] == week)
             ]
+        if pick.empty:
+            rows.append(
+                {
+                    "Player": profile["display_name"],
+                    "Pick": "Not submitted",
+                    "Source": "",
+                    "Points if Win": "",
+                    "Points if Loss": "",
+                    "Status": "",
+                }
+            )
+            continue
+        pick_row = pick.iloc[0]
+        game = week_games[week_games["id"] == pick_row["game_id"]]
+        if game.empty:
+            pick_label = pick_row["picked_team"]
+            win_points = loss_points = "TBD"
+            status = "Game not found"
+        else:
+            game_row = game.iloc[0]
+            summary = option_summary(game_row, pick_row["picked_team"])
+            pick_label = summary["Pick"]
+            win_points = summary["If Pick Wins"]
+            loss_points = summary["If Pick Loses"]
+            movement = pick_movement(game_row, pick_row["picked_team"])
+            if not bool(game_row.get("completed")):
+                status = "Pending"
+            elif pd.isna(game_row.get("winner_team")):
+                status = "Tie, 0 pts"
+            else:
+                result = "Win" if game_row["winner_team"] == pick_row["picked_team"] else "Loss"
+                status = f"{result}, {format_points_label(movement)}"
         rows.append(
             {
                 "Player": profile["display_name"],
-                "Pick": "Not submitted" if pick.empty else pick.iloc[0]["picked_team"],
+                "Pick": pick_label,
+                "Source": "Autopick" if pick_is_autopick(pick_row) else "Manual",
+                "Points if Win": win_points,
+                "Points if Loss": loss_points,
+                "Status": status,
             }
         )
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
 
 def history_page(games: pd.DataFrame, picks: pd.DataFrame, profiles: pd.DataFrame) -> None:
     st.header("Pick history")
     if picks.empty:
         st.info("No picks have been submitted.")
         return
-    game_columns = games[["id", "winner_team", "completed"]].rename(columns={"id": "game_id"})
+    game_columns = games[
+        ["id", "away_team", "home_team", "away_spread", "home_spread", "winner_team", "completed"]
+    ].rename(columns={"id": "game_id"})
     history = picks.merge(game_columns, on="game_id", how="left")
     history["Player"] = history["user_id"].map(lambda value: display_name(value, profiles))
+    history["Spread"] = history.apply(
+        lambda row: format_spread(pick_spread(row, row["picked_team"])), axis=1
+    )
+    history["Source"] = history.apply(
+        lambda row: "Autopick" if pick_is_autopick(row) else "Manual", axis=1
+    )
     history["Result"] = history.apply(
         lambda row: "Pending"
         if not row.get("completed", False)
-        else ("Win" if row["picked_team"] == row["winner_team"] else "Loss"),
+        else (
+            "Tie"
+            if pd.isna(row["winner_team"])
+            else ("Win" if row["picked_team"] == row["winner_team"] else "Loss")
+        ),
+        axis=1,
+    )
+    history["Points"] = history.apply(
+        lambda row: "Pending"
+        if not row.get("completed", False)
+        else format_points(pick_movement(row, row["picked_team"])),
         axis=1,
     )
     shown = history.rename(
         columns={"season": "Season", "week": "Week", "picked_team": "Pick"}
-    )[["Season", "Week", "Player", "Pick", "Result"]]
+    )[["Season", "Week", "Player", "Pick", "Spread", "Source", "Result", "Points"]]
     st.dataframe(
         shown.sort_values(["Season", "Week", "Player"], ascending=[False, False, True]),
         hide_index=True,
         use_container_width=True,
     )
 
-
 def standings_page(
     games: pd.DataFrame, picks: pd.DataFrame, profiles: pd.DataFrame, season: int
 ) -> None:
     st.header(f"{season} standings")
+    st.caption(f"Everyone starts at {STARTING_POINTS:g} points. Completed picks add the spread-based movement from the pool rules.")
     season_picks = picks[picks["season"] == season] if not picks.empty else picks
     season_games = games[games["season"] == season] if not games.empty else games
     rows = []
@@ -243,57 +478,92 @@ def standings_page(
             if not season_picks.empty
             else season_picks
         )
-        wins = losses = pending = 0
+        wins = losses = ties = pending = needs_spread = autopicks = 0
+        movement_total = 0.0
         for _, pick in player_picks.iterrows():
+            if pick_is_autopick(pick):
+                autopicks += 1
             game = season_games[season_games["id"] == pick["game_id"]]
             if game.empty or not bool(game.iloc[0]["completed"]):
                 pending += 1
-            elif game.iloc[0]["winner_team"] == pick["picked_team"]:
+                continue
+            game_row = game.iloc[0]
+            movement = pick_movement(game_row, pick["picked_team"])
+            if pd.isna(game_row["winner_team"]):
+                ties += 1
+                movement_total += 0.0
+            elif game_row["winner_team"] == pick["picked_team"]:
                 wins += 1
+                if movement is None:
+                    needs_spread += 1
+                else:
+                    movement_total += movement
             else:
                 losses += 1
+                if movement is None:
+                    needs_spread += 1
+                else:
+                    movement_total += movement
+        completed = wins + losses + ties
         rows.append(
             {
                 "Player": profile["display_name"],
+                "Points": STARTING_POINTS + movement_total,
+                "Movement": movement_total,
                 "Wins": wins,
                 "Losses": losses,
+                "Ties": ties,
                 "Pending": pending,
-                "Win %": round(100 * wins / (wins + losses), 1) if wins + losses else 0.0,
+                "Needs Spread": needs_spread,
+                "Autopicks": autopicks,
+                "Win %": round(100 * (wins + 0.5 * ties) / completed, 1) if completed else 0.0,
             }
         )
     standings = pd.DataFrame(rows)
     if standings.empty:
         st.info("No player profiles have been created yet.")
     else:
+        standings["Points"] = standings["Points"].map(lambda value: round(value, 1))
+        standings["Movement"] = standings["Movement"].map(lambda value: format_points(value))
         st.dataframe(
-            standings.sort_values(["Wins", "Losses"], ascending=[False, True]),
+            standings.sort_values(["Points", "Wins", "Losses"], ascending=[False, False, True]),
             hide_index=True,
             use_container_width=True,
         )
-
 
 def week_for_kickoff(kickoff: datetime) -> int:
     season_start = datetime.fromisoformat(str(setting("week_1_start", "2026-09-08T00:01:00-05:00")))
     return ((kickoff.astimezone(CT) - season_start).days // 7) + 1
 
 
-def import_odds() -> int:
+def import_games_and_odds() -> dict:
     api_key = st.secrets.get("odds_api", {}).get("api_key")
     if not api_key:
         raise ValueError("Missing [odds_api].api_key in Streamlit secrets.")
-    response = requests.get(
+
+    events_response = requests.get(
+        "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events",
+        params={"apiKey": api_key, "dateFormat": "iso"},
+        timeout=20,
+    )
+    events_response.raise_for_status()
+
+    odds_response = requests.get(
         "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds",
         params={
             "apiKey": api_key,
             "regions": "us",
-            "markets": "spreads,h2h",
+            "markets": "spreads",
             "oddsFormat": "american",
         },
         timeout=20,
     )
-    response.raise_for_status()
+    odds_response.raise_for_status()
+    odds_by_id = {game["id"]: game for game in odds_response.json()}
+
     rows = []
-    for game in response.json():
+    priced_games = 0
+    for game in events_response.json():
         kickoff = datetime.fromisoformat(game["commence_time"].replace("Z", "+00:00"))
         week = week_for_kickoff(kickoff)
         if not 1 <= week <= 22:
@@ -305,9 +575,13 @@ def import_odds() -> int:
             "away_team": game["away_team"],
             "home_team": game["home_team"],
             "kickoff": kickoff.isoformat(),
+            "away_spread": None,
+            "home_spread": None,
         }
+        odds_game = odds_by_id.get(game["id"], {})
         fanduel = next(
-            (book for book in game.get("bookmakers", []) if book["key"] == "fanduel"), None
+            (book for book in odds_game.get("bookmakers", []) if book["key"] == "fanduel"),
+            None,
         )
         if fanduel:
             spreads = next(
@@ -318,19 +592,25 @@ def import_odds() -> int:
                 points = {outcome["name"]: outcome.get("point") for outcome in spreads["outcomes"]}
                 row["away_spread"] = points.get(game["away_team"])
                 row["home_spread"] = points.get(game["home_team"])
+                priced_games += 1
         rows.append(row)
     if rows:
         admin_client().table("games").upsert(rows).execute()
-    return len(rows)
+    return {"games": len(rows), "priced_games": priced_games}
 
 
 def admin_page(games: pd.DataFrame) -> None:
     st.header("Admin")
-    st.caption("Import upcoming games and record final winners.")
-    if st.button("Refresh games from The Odds API"):
+    st.caption("Import the upcoming schedule and FanDuel odds, and record final winners.")
+    if message := st.session_state.pop("admin_message", None):
+        st.success(message)
+    if st.button("Refresh games and odds"):
         try:
-            count = import_odds()
-            st.success(f"Imported or updated {count} games.")
+            result = import_games_and_odds()
+            st.session_state.admin_message = (
+                f"Imported or updated {result['games']} games; "
+                f"{result['priced_games']} currently have FanDuel spreads."
+            )
             st.rerun()
         except Exception as exc:
             st.error(f"Import failed: {exc}")
@@ -348,25 +628,33 @@ def admin_page(games: pd.DataFrame) -> None:
     with st.form("result_form"):
         selected = st.selectbox("Game", list(labels))
         game = labels[selected]
-        winner = st.radio("Winner", [game["away_team"], game["home_team"]], horizontal=True)
+        winner = st.radio(
+            "Winner", [game["away_team"], game["home_team"], "Tie"], horizontal=True
+        )
         submitted = st.form_submit_button("Record final result")
     if submitted:
         admin_client().table("games").update(
-            {"winner_team": winner, "completed": True}
+            {"winner_team": None if winner == "Tie" else winner, "completed": True}
         ).eq("id", game["id"]).execute()
         st.success("Result recorded.")
         st.rerun()
 
 
 def main() -> None:
-    st.set_page_config(page_title="WeidaPicks", page_icon="🏈", layout="wide")
+    st.set_page_config(page_title="WeidaPicks", layout="wide")
     if not current_user():
         login()
         return
 
+    score_sync = sync_completed_scores()
+
     with st.sidebar:
-        st.title("🏈 WeidaPicks")
+        st.title("WeidaPicks")
         st.caption(current_user().email)
+        if score_sync.get("updated"):
+            st.success(f"Updated {score_sync['updated']} final score(s).")
+        if score_sync.get("error") and is_admin():
+            st.warning(f"Automatic score update failed: {score_sync['error']}")
         if st.button("Sign out"):
             logout()
 

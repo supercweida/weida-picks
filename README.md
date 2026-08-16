@@ -4,6 +4,19 @@ A four-player NFL pick pool built with Streamlit and Supabase. Players sign in,
 make one pick per week, review pick history, and see standings. An administrator
 imports upcoming games from The Odds API and records final winners.
 
+## Scoring
+
+Everyone starts each season with 30 points. Scores move after completed games
+using the picked team's FanDuel spread:
+
+- Winning underdog: gain the spread, such as `+3.5`.
+- Winning favorite: no point movement.
+- Losing underdog: lose 5 points.
+- Losing favorite: lose 5 points plus the favorite spread, such as `-8.5` for
+  a `-3.5` favorite.
+
+Moneyline odds are not used for scoring.
+
 ## Supabase setup
 
 1. Create a free project at <https://supabase.com>.
@@ -37,14 +50,21 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Sign in as the administrator and use **Admin > Refresh games from The Odds
-API**. The administrator can record each final winner on the same page. Results
-immediately flow into pick history and standings.
+Sign in as the administrator and use **Admin > Refresh games and odds** before
+the week's picks. The schedule comes from the Events endpoint, so games can be
+shown before FanDuel publishes betting markets. When any signed-in player opens
+the app, it checks for recently completed games and updates results
+automatically. Score checks are shared and limited to once every 15 minutes, and
+no API call is made when there are no started, unfinished games. The API only
+returns finals from the prior three days, so the administrator can still record
+a winner manually as a fallback. Results immediately flow into pick history and
+standings.
 
 ## Deploy free on Streamlit Community Cloud
 
 1. Push this repository to GitHub.
-2. Create an app at <https://share.streamlit.io> with `app.py` as the entrypoint.
+2. Create an app at <https://share.streamlit.io> with `app.py` as the
+   entrypoint.
 3. In the app's **Settings > Secrets**, paste the contents of your local
    `.streamlit/secrets.toml`.
 4. Deploy and share the resulting URL with the four players.
