@@ -76,13 +76,21 @@ def get_rows(table: str, columns: str = "*") -> list[dict]:
     return user_client().table(table).select(columns).execute().data or []
 
 
-def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def get_optional_rows(table: str, columns: str = "*") -> list[dict]:
+    try:
+        return get_rows(table, columns)
+    except Exception:
+        return []
+
+
+def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     games = pd.DataFrame(get_rows("games"))
     picks = pd.DataFrame(get_rows("picks"))
     profiles = pd.DataFrame(get_rows("profiles"))
+    adjustments = pd.DataFrame(get_optional_rows("standings_adjustments"))
     if not games.empty:
         games["kickoff"] = pd.to_datetime(games["kickoff"], utc=True)
-    return games, picks, profiles
+    return games, picks, profiles, adjustments
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -486,12 +494,19 @@ def history_page(games: pd.DataFrame, picks: pd.DataFrame, profiles: pd.DataFram
     )
 
 def standings_page(
-    games: pd.DataFrame, picks: pd.DataFrame, profiles: pd.DataFrame, season: int
+    games: pd.DataFrame,
+    picks: pd.DataFrame,
+    profiles: pd.DataFrame,
+    adjustments: pd.DataFrame,
+    season: int,
 ) -> None:
     st.header(f"{season} standings")
     st.caption(f"Everyone starts at {STARTING_POINTS:g} points. Completed picks add the spread-based movement from the pool rules.")
     season_picks = picks[picks["season"] == season] if not picks.empty else picks
     season_games = games[games["season"] == season] if not games.empty else games
+    season_adjustments = (
+        adjustments[adjustments["season"] == season] if not adjustments.empty else adjustments
+    )
     rows = []
     for _, profile in profiles.iterrows():
         player_picks = (
@@ -526,11 +541,19 @@ def standings_page(
                 else:
                     movement_total += movement
         completed = wins + losses + ties
+        manual_adjustment = 0.0
+        if not season_adjustments.empty:
+            profile_adjustments = season_adjustments[
+                season_adjustments["profile_id"] == profile["id"]
+            ]
+            if not profile_adjustments.empty:
+                manual_adjustment = float(profile_adjustments["points"].sum())
         rows.append(
             {
                 "Player": profile["display_name"],
-                "Points": STARTING_POINTS + movement_total,
+                "Points": STARTING_POINTS + movement_total + manual_adjustment,
                 "Movement": movement_total,
+                "Adjustment": manual_adjustment,
                 "Wins": wins,
                 "Losses": losses,
                 "Ties": ties,
@@ -546,6 +569,7 @@ def standings_page(
     else:
         standings["Points"] = standings["Points"].map(lambda value: round(value, 1))
         standings["Movement"] = standings["Movement"].map(lambda value: format_points(value))
+        standings["Adjustment"] = standings["Adjustment"].map(lambda value: format_points(value))
         st.dataframe(
             standings.sort_values(["Points", "Wins", "Losses"], ascending=[False, False, True]),
             hide_index=True,
@@ -620,9 +644,23 @@ def import_games_and_odds() -> dict:
     return {"games": len(rows), "priced_games": priced_games}
 
 
-def admin_page(games: pd.DataFrame) -> None:
+def result_label(game: pd.Series) -> str:
+    if not bool(game.get("completed")):
+        return "Pending"
+    winner = game.get("winner_team")
+    return "Tie" if pd.isna(winner) else f"Winner: {winner}"
+
+
+def admin_page(
+    games: pd.DataFrame,
+    picks: pd.DataFrame,
+    profiles: pd.DataFrame,
+    adjustments: pd.DataFrame,
+    season: int,
+    week: int,
+) -> None:
     st.header("Admin")
-    st.caption("Import the upcoming schedule and FanDuel odds, and record final winners.")
+    st.caption("Import schedule data and repair picks, results, or standings.")
     if message := st.session_state.pop("admin_message", None):
         st.success(message)
     if st.button("Refresh games and odds"):
@@ -638,27 +676,237 @@ def admin_page(games: pd.DataFrame) -> None:
 
     if games.empty:
         return
-    unfinished = games[~games["completed"]].sort_values("kickoff")
-    if unfinished.empty:
-        st.info("There are no unfinished games.")
+    result_tab, pick_tab, standings_tab = st.tabs(
+        ["Game Results", "User Picks", "Standings"]
+    )
+
+    with result_tab:
+        admin_game_result_form(games, season, week)
+
+    with pick_tab:
+        admin_pick_form(games, picks, profiles, season, week)
+
+    with standings_tab:
+        admin_standings_form(adjustments, profiles, season)
+
+
+def admin_game_result_form(games: pd.DataFrame, season: int, week: int) -> None:
+    st.subheader("Edit game result")
+    week_games = games[
+        (games["season"] == season) & (games["week"] == week)
+    ].sort_values("kickoff")
+    if week_games.empty:
+        st.info("There are no games for the selected season and week.")
         return
     labels = {
-        f"Week {row['week']}: {row['away_team']} at {row['home_team']}": row
-        for _, row in unfinished.iterrows()
+        (
+            f"{format_kickoff(row['kickoff'])}: {row['away_team']} at {row['home_team']} "
+            f"({result_label(row)})"
+        ): row
+        for _, row in week_games.iterrows()
     }
+    selected = st.selectbox("Game", list(labels), key="admin_result_game")
+    game = labels[selected]
+    current_result = result_label(game)
+    st.caption(f"Current result: {current_result}")
     with st.form("result_form"):
-        selected = st.selectbox("Game", list(labels))
-        game = labels[selected]
+        winner_options = ["Pending", game["away_team"], game["home_team"], "Tie"]
+        current_winner = (
+            "Tie"
+            if bool(game.get("completed")) and pd.isna(game.get("winner_team"))
+            else (game.get("winner_team") if bool(game.get("completed")) else "Pending")
+        )
+        winner_index = (
+            winner_options.index(current_winner)
+            if current_winner in winner_options
+            else 0
+        )
         winner = st.radio(
-            "Winner", [game["away_team"], game["home_team"], "Tie"], horizontal=True
+            "Winner",
+            winner_options,
+            index=winner_index,
+            horizontal=True,
+            key=f"admin_result_winner_{game['id']}",
         )
         submitted = st.form_submit_button("Record final result")
     if submitted:
+        completed = winner != "Pending"
         admin_client().table("games").update(
-            {"winner_team": None if winner == "Tie" else winner, "completed": True}
+            {
+                "winner_team": None if winner in ("Pending", "Tie") else winner,
+                "completed": completed,
+            }
         ).eq("id", game["id"]).execute()
-        st.success("Result recorded.")
+        st.success("Result updated.")
         st.rerun()
+
+
+def admin_pick_form(
+    games: pd.DataFrame,
+    picks: pd.DataFrame,
+    profiles: pd.DataFrame,
+    season: int,
+    week: int,
+) -> None:
+    st.subheader("Edit user pick")
+    if profiles.empty:
+        st.info("No player profiles have been created yet.")
+        return
+    week_games = games[
+        (games["season"] == season) & (games["week"] == week)
+    ].sort_values("kickoff")
+    if week_games.empty:
+        st.info("There are no games for the selected season and week.")
+        return
+
+    profile_labels = {
+        str(row["display_name"]): row for _, row in profiles.sort_values("display_name").iterrows()
+    }
+    game_options: dict[str, tuple[str, str]] = {}
+    for _, game in week_games.iterrows():
+        for team in (game["away_team"], game["home_team"]):
+            summary = option_summary(game, team)
+            label = (
+                f"{summary['Game']} - {summary['Pick']} "
+                f"({summary['Kickoff']})"
+            )
+            game_options[label] = (game["id"], team)
+
+    selected_player = st.selectbox("Player", list(profile_labels), key="admin_pick_player")
+    profile = profile_labels[selected_player]
+    existing_pick = pd.DataFrame()
+    if not picks.empty:
+        existing_pick = picks[
+            (picks["user_id"] == profile["id"])
+            & (picks["season"] == season)
+            & (picks["week"] == week)
+        ]
+    existing_label = None
+    existing_autopick = False
+    if not existing_pick.empty:
+        pick_row = existing_pick.iloc[0]
+        existing_autopick = pick_is_autopick(pick_row)
+        existing_label = next(
+            (
+                label
+                for label, value in game_options.items()
+                if value == (pick_row["game_id"], pick_row["picked_team"])
+            ),
+            None,
+        )
+
+    with st.form("admin_pick_form"):
+        labels = list(game_options)
+        selected_pick = st.selectbox(
+            "Pick",
+            labels,
+            index=labels.index(existing_label) if existing_label in labels else 0,
+            key=f"admin_pick_choice_{profile['id']}_{season}_{week}",
+        )
+        is_autopick = st.checkbox(
+            "Mark as autopick",
+            value=existing_autopick,
+            key=f"admin_pick_autopick_{profile['id']}_{season}_{week}",
+        )
+        save_pick = st.form_submit_button("Save pick", type="primary")
+        delete_pick = st.form_submit_button("Delete this user's pick")
+
+    if save_pick:
+        game_id, picked_team = game_options[selected_pick]
+        payload = {
+            "user_id": profile["id"],
+            "game_id": game_id,
+            "season": season,
+            "week": week,
+            "picked_team": picked_team,
+            "is_autopick": is_autopick,
+        }
+        admin_client().table("picks").upsert(
+            payload, on_conflict="user_id,season,week"
+        ).execute()
+        st.success(f"Saved {picked_team} for {selected_player}.")
+        st.rerun()
+
+    if delete_pick:
+        admin_client().table("picks").delete().eq("user_id", profile["id"]).eq(
+            "season", season
+        ).eq("week", week).execute()
+        st.success(f"Deleted {selected_player}'s Week {week} pick.")
+        st.rerun()
+
+
+def admin_standings_form(
+    adjustments: pd.DataFrame, profiles: pd.DataFrame, season: int
+) -> None:
+    st.subheader("Edit standings adjustment")
+    st.caption("Use this for manual point corrections. Game and pick edits remain the source of normal scoring.")
+    if profiles.empty:
+        st.info("No player profiles have been created yet.")
+        return
+
+    profile_labels = {
+        str(row["display_name"]): row for _, row in profiles.sort_values("display_name").iterrows()
+    }
+    selected_player = st.selectbox("Player", list(profile_labels), key="adjustment_player")
+    profile = profile_labels[selected_player]
+    existing = pd.DataFrame()
+    if not adjustments.empty:
+        existing = adjustments[
+            (adjustments["profile_id"] == profile["id"])
+            & (adjustments["season"] == season)
+        ]
+    existing_points = float(existing.iloc[0]["points"]) if not existing.empty else 0.0
+    existing_reason = (
+        str(existing.iloc[0].get("reason") or "") if not existing.empty else ""
+    )
+    with st.form("standings_adjustment_form"):
+        points = st.number_input(
+            "Manual point adjustment",
+            value=existing_points,
+            step=0.5,
+            format="%.1f",
+            key=f"adjustment_points_{profile['id']}_{season}",
+        )
+        reason = st.text_input(
+            "Reason",
+            value=existing_reason,
+            key=f"adjustment_reason_{profile['id']}_{season}",
+        )
+        save_adjustment = st.form_submit_button("Save adjustment", type="primary")
+        clear_adjustment = st.form_submit_button("Clear adjustment")
+
+    if save_adjustment:
+        payload = {
+            "profile_id": profile["id"],
+            "season": season,
+            "points": points,
+            "reason": reason.strip() or None,
+            "updated_at": datetime.now(CT).isoformat(),
+        }
+        try:
+            admin_client().table("standings_adjustments").upsert(
+                payload, on_conflict="profile_id,season"
+            ).execute()
+            st.success(f"Saved {format_points_label(points)} adjustment for {selected_player}.")
+            st.rerun()
+        except Exception as exc:
+            st.error(
+                "Could not save the adjustment. Run the updated supabase_schema.sql "
+                f"to add the standings_adjustments table, then try again.\n\n{exc}"
+            )
+
+    if clear_adjustment:
+        try:
+            admin_client().table("standings_adjustments").delete().eq(
+                "profile_id", profile["id"]
+            ).eq("season", season).execute()
+            st.success(f"Cleared the adjustment for {selected_player}.")
+            st.rerun()
+        except Exception as exc:
+            st.error(
+                "Could not clear the adjustment. Run the updated supabase_schema.sql "
+                f"to add the standings_adjustments table, then try again.\n\n{exc}"
+            )
 
 
 def main() -> None:
@@ -680,7 +928,7 @@ def main() -> None:
             logout()
 
     try:
-        games, picks, profiles = load_data()
+        games, picks, profiles, adjustments = load_data()
     except Exception as exc:
         st.error(f"Could not load pool data. Has supabase_schema.sql been installed?\n\n{exc}")
         return
@@ -698,9 +946,9 @@ def main() -> None:
     elif page == "History":
         history_page(games, picks, profiles)
     elif page == "Standings":
-        standings_page(games, picks, profiles, season)
+        standings_page(games, picks, profiles, adjustments, season)
     else:
-        admin_page(games)
+        admin_page(games, picks, profiles, adjustments, season, week)
 
 
 if __name__ == "__main__":
