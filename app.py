@@ -259,6 +259,27 @@ def season_and_week(games: pd.DataFrame) -> tuple[int, int]:
     return int(season), int(week)
 
 
+def sidebar_page_nav(page_names: list[str]) -> str:
+    current = st.session_state.get("page", page_names[0])
+    if current not in page_names:
+        current = page_names[0]
+        st.session_state.page = current
+
+    st.sidebar.caption("Navigation")
+    for name in page_names:
+        is_current = name == current
+        clicked = st.sidebar.button(
+            name,
+            key=f"nav_{name.lower().replace(' ', '_')}",
+            type="primary" if is_current else "secondary",
+            use_container_width=True,
+        )
+        if clicked and not is_current:
+            st.session_state.page = name
+            st.rerun()
+    return current
+
+
 def make_pick_page(
     games: pd.DataFrame, picks: pd.DataFrame, profiles: pd.DataFrame, season: int, week: int
 ) -> None:
@@ -313,7 +334,7 @@ def make_pick_page(
         "if that pick wins or loses."
     )
     st.dataframe(
-        pd.DataFrame(option_rows)[["Game", "Kickoff", "Pick", "If Pick Wins", "If Pick Loses"]],
+        pd.DataFrame(option_rows)[["Game", "Pick", "Kickoff", "If Pick Wins", "If Pick Loses"]],
         hide_index=True,
         use_container_width=True,
     )
@@ -667,7 +688,7 @@ def main() -> None:
     page_names = ["Make Pick", "Weekly Picks", "History", "Standings"]
     if is_admin():
         page_names.append("Admin")
-    page = st.sidebar.radio("Page", page_names)
+    page = sidebar_page_nav(page_names)
     season, week = season_and_week(games)
 
     if page == "Make Pick":
