@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from re import sub
 from zoneinfo import ZoneInfo
 
@@ -11,6 +12,7 @@ import streamlit as st
 
 
 CT = ZoneInfo("America/Chicago")
+HISTORY_PATH = Path("data") / "history.csv"
 POINT_VALUES = list(range(1, 19))
 NFL_TEAMS = [
     "Arizona Cardinals",
@@ -99,7 +101,22 @@ def normalize_history(history: pd.DataFrame) -> pd.DataFrame:
     return normalized.dropna(subset=["Season", "Week"])
 
 
-def load_history(uploaded_file) -> pd.DataFrame:
+def load_local_history() -> pd.DataFrame:
+    if not HISTORY_PATH.exists():
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+    try:
+        return normalize_history(pd.read_csv(HISTORY_PATH))
+    except Exception as exc:
+        st.warning(f"Could not read saved history from {HISTORY_PATH}: {exc}")
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+
+def save_local_history(history: pd.DataFrame) -> None:
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    normalize_history(history).to_csv(HISTORY_PATH, index=False)
+
+
+def load_workbook_history(uploaded_file) -> pd.DataFrame:
     if uploaded_file is None:
         return pd.DataFrame(columns=HISTORY_COLUMNS)
     try:
@@ -181,28 +198,51 @@ def fetch_matchups(season: int) -> tuple[pd.DataFrame, str | None]:
         return pd.DataFrame(columns=MATCHUP_COLUMNS), str(exc)
 
 
-def current_week_entries(participants: list[str], season: int, week: int) -> pd.DataFrame:
+def current_week_entries(
+    participants: list[str],
+    season: int,
+    week: int,
+    saved_history: pd.DataFrame,
+) -> pd.DataFrame:
     rows = []
     st.subheader("Enter completed-week picks")
-    st.caption("Leave a player blank if you only need to regenerate a workbook without adding a new result.")
+    st.caption("These entries can be saved locally, then used to generate every future workbook.")
+    week_history = saved_history[
+        (saved_history["Season"].astype("Int64") == season)
+        & (saved_history["Week"].astype("Int64") == week)
+    ] if not saved_history.empty else saved_history
     for player in participants:
+        existing = week_history[week_history["Player"] == player] if not week_history.empty else week_history
+        existing_team = str(existing.iloc[0]["Team"]) if not existing.empty else ""
+        existing_points = (
+            int(existing.iloc[0]["Point Value"])
+            if not existing.empty and pd.notna(existing.iloc[0]["Point Value"])
+            else ""
+        )
+        existing_result = str(existing.iloc[0]["Result"]) if not existing.empty else "Pending"
         cols = st.columns([2, 3, 2, 2])
         cols[0].markdown(f"**{player}**")
+        team_options = [""] + NFL_TEAMS
+        point_options = [""] + POINT_VALUES
+        result_options = ["Pending", "Win", "Loss", "Tie"]
         team = cols[1].selectbox(
             "Team",
-            [""] + NFL_TEAMS,
+            team_options,
+            index=team_options.index(existing_team) if existing_team in team_options else 0,
             key=f"team_{player}_{season}_{week}",
             label_visibility="collapsed",
         )
         points = cols[2].selectbox(
             "Points",
-            [""] + POINT_VALUES,
+            point_options,
+            index=point_options.index(existing_points) if existing_points in point_options else 0,
             key=f"points_{player}_{season}_{week}",
             label_visibility="collapsed",
         )
         result = cols[3].selectbox(
             "Result",
-            ["Pending", "Win", "Loss", "Tie"],
+            result_options,
+            index=result_options.index(existing_result) if existing_result in result_options else 0,
             key=f"result_{player}_{season}_{week}",
             label_visibility="collapsed",
         )
@@ -344,10 +384,25 @@ def main() -> None:
         participant_text = st.text_area("Participants", "\n".join(default_participants()), height=120)
         participants = [name.strip() for name in participant_text.splitlines() if name.strip()]
 
-    uploaded = st.file_uploader("Upload the previous workbook", type=["xlsx"])
-    prior_history = load_history(uploaded)
-    current_entries = current_week_entries(participants, int(season), int(completed_week))
-    history = combine_history(prior_history, current_entries, int(season), int(completed_week))
+    saved_history = load_local_history()
+
+    with st.expander("Import history from an older workbook"):
+        uploaded = st.file_uploader("Optional workbook import", type=["xlsx"])
+        imported_history = load_workbook_history(uploaded)
+        if uploaded is not None and st.button("Save imported history locally"):
+            save_local_history(imported_history)
+            st.success(f"Imported history saved to {HISTORY_PATH}.")
+            st.rerun()
+
+    current_entries = current_week_entries(participants, int(season), int(completed_week), saved_history)
+    history = combine_history(saved_history, current_entries, int(season), int(completed_week))
+
+    cols = st.columns([1, 3])
+    if cols[0].button("Save weekly entries", type="primary", use_container_width=True):
+        save_local_history(history)
+        st.success(f"Saved season history to {HISTORY_PATH}.")
+        st.rerun()
+    cols[1].caption(f"Saved history file: {HISTORY_PATH}")
 
     st.subheader("Season availability")
     availability = availability_rows(history, participants, int(season))

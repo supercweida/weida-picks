@@ -3,9 +3,10 @@
 A small Streamlit tool for generating a distributable NFL confidence survivor
 workbook.
 
-The workbook is the source of truth. Each week, upload the prior workbook,
-enter the four players' completed-week picks and results, then download the
-next workbook for distribution.
+The app keeps the season record locally in `data/history.csv`. Each week, enter
+the four players' completed-week picks and results, save them, then download the
+next workbook for distribution. Uploading an older workbook is only needed if
+you want to import or recover history.
 
 ## Pool Format
 
@@ -22,7 +23,7 @@ Each generated workbook includes:
 - `Availability`: each player's remaining teams and point values.
 - `Week N Matchups`: the upcoming week's NFL schedule from The Odds API.
 - `Pick Sheet`: a simple sheet participants can use for the next pick.
-- `History`: the season record used by the app when re-uploaded later.
+- `History`: a copy of the season record included for audit/recovery.
 - One tab per matchup showing which players still have each team available.
 
 ## Secrets
