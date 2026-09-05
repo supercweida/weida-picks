@@ -1,74 +1,53 @@
 # WeidaPicks
 
-A four-player NFL pick pool built with Streamlit and Supabase. Players sign in,
-make one pick per week, review pick history, and see standings. An administrator
-imports upcoming games from The Odds API and records final winners.
+A small Streamlit tool for generating a distributable NFL confidence survivor
+workbook.
 
-## Scoring
+The workbook is the source of truth. Each week, upload the prior workbook,
+enter the four players' completed-week picks and results, then download the
+next workbook for distribution.
 
-Everyone starts each season with 30 points. Scores move after completed games
-using the picked team's FanDuel spread:
+## Pool Format
 
-- Winning underdog: gain the spread, such as `+3.5`.
-- Winning favorite: no point movement.
-- Losing underdog: lose 5 points.
-- Losing favorite: lose 5 points plus the favorite spread, such as `-8.5` for
-  a `-3.5` favorite.
+- Four participants.
+- Each week, each participant picks one NFL team to win.
+- Each pick also uses one confidence value from 1 through 18.
+- A participant cannot reuse a team during the season.
+- A participant cannot reuse a confidence value during the season.
 
-Moneyline odds are not used for scoring.
+## Workbook Tabs
 
-## Supabase setup
+Each generated workbook includes:
 
-1. Create a free project at <https://supabase.com>.
-2. Open **SQL Editor**, paste `supabase_schema.sql`, and run it once.
-3. In **Authentication > Users**, create the four users with email/password.
-   Turn on **Auto Confirm User** when creating them so no confirmation email is
-   needed.
-4. Add one profile row for each user in SQL Editor:
+- `Availability`: each player's remaining teams and point values.
+- `Week N Matchups`: the upcoming week's NFL schedule from The Odds API.
+- `Pick Sheet`: a simple sheet participants can use for the next pick.
+- `History`: the season record used by the app when re-uploaded later.
+- One tab per matchup showing which players still have each team available.
 
-   ```sql
-   insert into public.profiles (id, display_name)
-   select id, 'Weida' from auth.users where email = 'weida@example.com';
-   ```
+## Secrets
 
-   Repeat that statement with the other three names and emails.
-5. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill
-   in the project URL, publishable/anon key, service-role key, a newly rotated
-   Odds API key, and the administrator's email.
+Only The Odds API key is required:
 
-The service-role key bypasses database security. Never commit
-`.streamlit/secrets.toml` or expose that key in browser-side code.
+```toml
+[odds_api]
+api_key = "your-key"
 
-## Run locally
+[app]
+season = 2026
+week_1_start = "2026-09-08T00:01:00-05:00"
+participants = ["Weida", "Player 2", "Player 3", "Player 4"]
+```
+
+`participants` is optional; you can also edit the names in the sidebar.
+
+## Run Locally
 
 Use Python 3.11 or newer:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-Sign in as the administrator and use **Admin > Refresh games and odds** before
-the week's picks. The schedule comes from the Events endpoint, so games can be
-shown before FanDuel publishes betting markets. When any signed-in player opens
-the app, it checks for recently completed games and updates results
-automatically. Score checks are shared and limited to once every 15 minutes, and
-no API call is made when there are no started, unfinished games. The API only
-returns finals from the prior three days, so the administrator can still record
-a winner manually as a fallback. Results immediately flow into pick history and
-standings.
-
-## Deploy free on Streamlit Community Cloud
-
-1. Push this repository to GitHub.
-2. Create an app at <https://share.streamlit.io> with `app.py` as the
-   entrypoint.
-3. In the app's **Settings > Secrets**, paste the contents of your local
-   `.streamlit/secrets.toml`.
-4. Deploy and share the resulting URL with the four players.
-
-The database enforces one pick per player per week and rejects new or changed
-picks after the selected game's kickoff. Streamlit may hibernate after a period
-without traffic, but Supabase keeps the pool data independently of the app.
