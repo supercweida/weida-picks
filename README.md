@@ -20,11 +20,9 @@ you want to import or recover history.
 
 Each generated workbook includes:
 
-- `Availability`: each player's remaining teams and point values.
-- `Week N Matchups`: the upcoming week's NFL schedule from The Odds API.
-- `Pick Sheet`: a simple sheet participants can use for the next pick.
-- `History`: a copy of the season record included for audit/recovery.
-- One tab per matchup showing which players still have each team available.
+- `Scoreboard`: season standings using winning confidence points.
+- `Week Matchups`: the upcoming week's NFL schedule from The Odds API.
+- One tab per participant with available teams and point values listed as rows.
 
 ## Secrets
 

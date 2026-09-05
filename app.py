@@ -308,19 +308,78 @@ def validation_messages(history: pd.DataFrame, season: int) -> list[str]:
     return messages
 
 
-def matchup_tab(matchup: pd.Series, availability: pd.DataFrame, history: pd.DataFrame) -> pd.DataFrame:
-    away = matchup["Away Team"]
-    home = matchup["Home Team"]
+def scoreboard_rows(history: pd.DataFrame, participants: list[str], season: int) -> pd.DataFrame:
     rows = []
-    for _, player in availability.iterrows():
-        player_history = history[history["Player"] == player["Player"]] if not history.empty else history
-        used_teams = set(player_history["Team"].dropna())
+    season_history = history[history["Season"].astype("Int64") == season] if not history.empty else history
+    for player in participants:
+        player_history = season_history[season_history["Player"] == player] if not season_history.empty else season_history
+        wins = int((player_history["Result"] == "Win").sum()) if not player_history.empty else 0
+        losses = int((player_history["Result"] == "Loss").sum()) if not player_history.empty else 0
+        ties = int((player_history["Result"] == "Tie").sum()) if not player_history.empty else 0
+        pending = int((player_history["Result"] == "Pending").sum()) if not player_history.empty else 0
+        points = (
+            int(player_history.loc[player_history["Result"] == "Win", "Point Value"].dropna().sum())
+            if not player_history.empty
+            else 0
+        )
         rows.append(
             {
-                "Player": player["Player"],
-                f"{away} Available": "Yes" if away not in used_teams else "No",
-                f"{home} Available": "Yes" if home not in used_teams else "No",
-                "Available Point Values": player["Available Point Values"],
+                "Player": player,
+                "Points": points,
+                "Wins": wins,
+                "Losses": losses,
+                "Ties": ties,
+                "Pending": pending,
+                "Teams Used": len(set(player_history["Team"].dropna()) - {""}) if not player_history.empty else 0,
+                "Point Values Used": int(player_history["Point Value"].dropna().nunique()) if not player_history.empty else 0,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["Points", "Wins", "Losses"], ascending=[False, False, True])
+
+
+def participant_options_rows(
+    history: pd.DataFrame,
+    matchups: pd.DataFrame,
+    player: str,
+    season: int,
+    distribution_week: int,
+) -> pd.DataFrame:
+    season_history = history[history["Season"].astype("Int64") == season] if not history.empty else history
+    player_history = season_history[season_history["Player"] == player] if not season_history.empty else season_history
+    used_teams = set(player_history["Team"].dropna()) - {""}
+    used_points = set(int(value) for value in player_history["Point Value"].dropna())
+
+    week_matchups = matchups[matchups["Week"].astype(int) == distribution_week].copy() if not matchups.empty else matchups
+    team_rows = []
+    for _, matchup in week_matchups.iterrows():
+        kickoff = format_kickoff(matchup["Kickoff"])
+        for side, opponent_side in [("Away", "Home"), ("Home", "Away")]:
+            team = matchup[f"{side} Team"]
+            if team in used_teams:
+                continue
+            opponent = matchup[f"{opponent_side} Team"]
+            spread = matchup[f"{side} Spread"]
+            team_rows.append(
+                {
+                    "Available Team": team,
+                    "Opponent": opponent,
+                    "Kickoff": kickoff,
+                    "Spread": spread,
+                }
+            )
+
+    max_rows = max(len(team_rows), len(POINT_VALUES) - len(used_points), 1)
+    rows = []
+    available_points = [value for value in POINT_VALUES if value not in used_points]
+    for index in range(max_rows):
+        team_row = team_rows[index] if index < len(team_rows) else {}
+        rows.append(
+            {
+                "Available Team": team_row.get("Available Team", ""),
+                "Opponent": team_row.get("Opponent", ""),
+                "Kickoff": team_row.get("Kickoff", ""),
+                "Spread": team_row.get("Spread", ""),
+                "Available Point Value": available_points[index] if index < len(available_points) else "",
             }
         )
     return pd.DataFrame(rows)
@@ -333,35 +392,24 @@ def build_workbook(
     season: int,
     distribution_week: int,
 ) -> bytes:
-    availability = availability_rows(history, participants, season)
     week_matchups = matchups[matchups["Week"].astype(int) == distribution_week].copy()
     week_matchups["Kickoff"] = week_matchups["Kickoff"].map(format_kickoff)
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        availability.to_excel(writer, sheet_name="Availability", index=False)
-        week_matchups[MATCHUP_COLUMNS].to_excel(writer, sheet_name=f"Week {distribution_week} Matchups", index=False)
-        history.sort_values(["Week", "Player"]).to_excel(writer, sheet_name="History", index=False)
-
-        pick_sheet = availability[["Player", "Available Teams", "Available Point Values"]].copy()
-        pick_sheet.insert(1, "Week", distribution_week)
-        pick_sheet["Pick"] = ""
-        pick_sheet["Point Value"] = ""
-        pick_sheet.to_excel(writer, sheet_name="Pick Sheet", index=False)
+        scoreboard_rows(history, participants, season).to_excel(writer, sheet_name="Scoreboard", index=False)
+        week_matchups[MATCHUP_COLUMNS].to_excel(writer, sheet_name="Week Matchups", index=False)
 
         used_names = set(writer.book.sheetnames)
-        for _, matchup in week_matchups.iterrows():
-            label = safe_sheet_name(
-                f"{matchup['Away Team'].split()[-1]} at {matchup['Home Team'].split()[-1]}",
-                used_names,
-            )
-            tab = matchup_tab(matchup, availability, history)
-            tab.to_excel(writer, sheet_name=label, index=False, startrow=3)
-            sheet = writer.book[label]
-            sheet["A1"] = f"{matchup['Away Team']} at {matchup['Home Team']}"
-            sheet["A2"] = matchup["Kickoff"]
-            sheet["D1"] = "Spread"
-            sheet["D2"] = f"{matchup['Away Spread']} / {matchup['Home Spread']}"
+        for player in participants:
+            label = safe_sheet_name(player, used_names)
+            participant_options_rows(
+                history,
+                matchups,
+                player,
+                season,
+                distribution_week,
+            ).to_excel(writer, sheet_name=label, index=False)
 
         for sheet in writer.book.worksheets:
             sheet.freeze_panes = "A2"
