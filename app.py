@@ -272,6 +272,22 @@ def combine_history(history: pd.DataFrame, entries: pd.DataFrame, season: int, w
     return normalize_history(pd.concat([history[keep], entries], ignore_index=True))
 
 
+def merge_history(history: pd.DataFrame, imported_history: pd.DataFrame) -> pd.DataFrame:
+    history = normalize_history(history)
+    imported_history = normalize_history(imported_history)
+    if imported_history.empty:
+        return history
+    if history.empty:
+        return imported_history
+    merged = pd.concat([history, imported_history], ignore_index=True)
+    return normalize_history(
+        merged.drop_duplicates(
+            subset=["Season", "Week", "Player"],
+            keep="last",
+        )
+    )
+
+
 def availability_rows(history: pd.DataFrame, participants: list[str], season: int) -> pd.DataFrame:
     rows = []
     season_history = history[history["Season"].astype("Int64") == season] if not history.empty else history
@@ -399,6 +415,7 @@ def build_workbook(
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         scoreboard_rows(history, participants, season).to_excel(writer, sheet_name="Scoreboard", index=False)
         week_matchups[MATCHUP_COLUMNS].to_excel(writer, sheet_name="Week Matchups", index=False)
+        normalize_history(history).to_excel(writer, sheet_name="History", index=False)
 
         used_names = set(writer.book.sheetnames)
         for player in participants:
@@ -437,8 +454,11 @@ def main() -> None:
     with st.expander("Import history from an older workbook"):
         uploaded = st.file_uploader("Optional workbook import", type=["xlsx"])
         imported_history = load_workbook_history(uploaded)
-        if uploaded is not None and st.button("Save imported history locally"):
-            save_local_history(imported_history)
+        if uploaded is not None and imported_history.empty:
+            st.warning("That workbook does not contain importable history. Workbooks downloaded after this update will include a History tab.")
+        elif uploaded is not None and st.button("Save imported history locally"):
+            merged_history = merge_history(saved_history, imported_history)
+            save_local_history(merged_history)
             st.success(f"Imported history saved to {HISTORY_PATH}.")
             st.rerun()
 
